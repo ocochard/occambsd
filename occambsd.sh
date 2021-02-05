@@ -37,6 +37,28 @@
 # The separate kernel directory is VERY useful for testing kernel changes
 # while waiting for institutionalized VirtFS support
 
+set -eu
+
+# Functions
+
+# A usefull function (from: http://code.google.com/p/sh-die/)
+die() { echo -n "EXIT: " >&2; echo "$@" >&2; exit 1; }
+
+##### Check if previous NanoBSD make stop correctly by unoumt all tmp mount
+# exit with 0 if no problem detected
+# exit with 1 if problem detected, but clean it
+# exit with 2 if problem detected and can't clean it
+check_clean() {
+    # Check all working dir allready mounted and unmount them
+    # Patch from Warner Losh (imp@)
+    __a=`mount | grep $1 | awk '{print length($3), $3;}' | sort -rn \
+        | awk '{$1=""; print;}'`
+    if [ -n "$__a" ]; then
+        echo "unmounting $__a"
+        umount $__a
+    fi
+}
+
 # Variables
 
 playground="/tmp/occambsd"		# This will be mounted tmpfs
@@ -44,63 +66,35 @@ imagesize="4G"				# More than enough room
 md_id="md42"				# Ask Douglas Adams for an explanation
 buildjobs="$(sysctl -n hw.ncpu)"
 
-[ -f /usr/src/sys/amd64/conf/GENERIC ] || \
-	{ echo Sources do not appear to be installed ; exit 1 ; }
+if [ $(id -u) -ne 0 ]; then
+	die "Need to be root"
+fi
+
+[ -f /usr/src/sys/amd64/conf/GENERIC ] || die "Sources do not appear to be installed"
 
 # Cleanup - tmpfs mounts are not always dected by mount | grep tmpfs ...
 #	They may also be mounted multiple times atop one another and
 #	md devices may be attached multiple times. Proper cleanup would be nice
 
-umount "$playground/mnt"
-umount "$playground"
-umount "$playground"
-umount "/usr/obj"
-umount "/usr/obj"
-mdconfig -du "$md_id"
-mdconfig -du "$md_id"
+mdconfig -l | grep -q $md_id && mdconfig -du "$md_id"
+check_clean $playground
+#umount "$playground/mnt"
+#umount "$playground"
+#check_clean "/usr/obj"
 
-echo
-echo Do any memory devices or tmpfs mounts need to be cleaned up? Listing...
-echo Press the elusive ANY key if you do not see any to continue
-echo
-
-mdconfig -lv
-mount | grep "$playground"
-mount | grep "/usr/obj"
-read clean
-
-[ -d $playground ] || mkdir -p "$playground"
+mkdir -p "$playground"
 
 echo Mounting $playground tmpfs
-mount -t tmpfs tmpfs "$playground" || {
-	echo tmpfs mount failed
-	exit 1
-}
+mount -t tmpfs tmpfs "$playground" ||  die "tmpfs mount failed"
 
 echo Making directories in $playground
 mkdir -p "$playground/root/boot"
 mkdir -p "$playground/root/etc"
 mkdir -p "$playground/jail"
 mkdir -p "$playground/mnt"
+mkdir -p "$playground/obj"
 
-echo Mounting a tmpfs to /usr/obj/
-mount -t tmpfs tmpfs /usr/obj/
-
-mount | grep tmpfs
-
-if [ -f /etc/src.conf ]; then
-	echo
-	echo /etc/src.conf exists
-	echo Type d to delete or the elusive ANY key to exit
-	read response
-	if [ "$response" = "d" ]; then
-		rm /etc/src.conf
-	else
-		exit 1
-	fi
-fi
-
-echo Generating /etc/src.conf
+echo Generating $playground/src.conf
 sh /usr/src/tools/tools/build_option_survey/listallopts.sh | grep -v WITH_ | sed 's/$/=YES/' | \
 	grep -v WITHOUT_AUTO_OBJ | \
 	grep -v WITHOUT_UNIFIED_OBJDIR | \
@@ -115,7 +109,7 @@ sh /usr/src/tools/tools/build_option_survey/listallopts.sh | grep -v WITH_ | sed
 	grep -v WITHOUT_LOCALES | \
 	grep -v WITHOUT_ZONEINFO | \
 	grep -v WITHOUT_VI \
-	> /etc/src.conf
+	> $playground/src.conf
 
 # WITHOUT_AUTO_OBJ and WITHOUT_UNIFIED_OBJDIR warn that they go in src-env.conf
 # <broken build options>
@@ -125,12 +119,10 @@ sh /usr/src/tools/tools/build_option_survey/listallopts.sh | grep -v WITH_ | sed
 # WITHOUT_ZONEINFO is necessary for the timzone setting on VM image with a userland
 # WITHOUT_VI could come in handy
 
-[ -f /etc/src.conf ] || { echo /etc/src.conf did not generate ; exit 1 ; }
+# XXX useless ?
+[ -f $playground/src.conf ] || die "$playground/src.conf did not generate"
 
-cat /etc/src.conf
-
-echo Press the elusive ANY key to continue
-read anykey
+cat $playground/src.conf
 
 echo Removing OCCAM KERNCONF if present
 [ -f /usr/src/sys/amd64/conf/OCCAM ] && rm /usr/src/sys/amd64/conf/OCCAM
@@ -195,45 +187,28 @@ cat /usr/src/sys/amd64/conf/OCCAM
 echo Entering the /usr/src directory
 cd /usr/src/
 
-echo Press the elusive ANY key to continue to buildworld
-read anykey
-
 echo Building world with
-echo make -j$buildjobs buildworld
-\time -h make -j$buildjobs buildworld || {
-	echo buildworld failed
-	exit 1
-}
-
-echo Press the elusive ANY key to continue to buildkernel
-read anykey
+CMD="make -j$buildjobs SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj buildworld"
+echo $CMD
+\time -h $CMD || die "buildworld failed"
 
 echo Building the kernel with
-echo make -j$buildjobs buildkernel KERNCONF=OCCAM
-\time -h make -j$buildjobs buildkernel KERNCONF=OCCAM || {
-	echo buildkernel failed
-	exit 1
-}
-
-echo Press the elusive ANY key to continue to VM image creation
-read anykey
+CMD="make -j$buildjobs SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj buildkernel KERNCONF=OCCAM"
+echo $CMD
+\time -h $CMD || die "buildkernel failed"
 
 echo Seeing how big the resulting kernel is
-ls -lh /usr/obj/usr/src/amd64.amd64/sys/OCCAM/kernel
+ls -lh $playground/obj/usr/src/sys/OCCAM/kernel
 
 echo Truncating VM image - consider -t malloc and tmpfs
-truncate -s "$imagesize" "$playground/occambsd.raw" || {
-	echo image truncation failed
-	exit 1
-}
+truncate -s "$imagesize" "$playground/occambsd.raw" || die "image truncation failed"
 
-[ -f $playground/occambsd.raw ] || \
-	{ echo $playground/occambsd.raw did not create ; exit 1 ; }
+[ -f $playground/occambsd.raw ] || die "$playground/occambsd.raw did not create"
 
 echo Attaching VM image
 mdconfig -a -u "$md_id" -f "$playground/occambsd.raw"
 
-[ -e /dev/$md_id ] || { echo $md_id did not attach ; exit 1 ; }
+[ -e /dev/$md_id ] || die "$md_id did not attach"
 
 echo Partitioning and formating $md_id
 gpart create -s gpt "$md_id"
@@ -244,33 +219,27 @@ gpart add -t freebsd-ufs "$md_id"
 
 echo The occambsd.raw partitioning is:
 gpart show "$md_id"
-newfs -U /dev/${md_id}p3 || {
-	echo newfs failed
-	exit 1
-}
+newfs -U /dev/${md_id}p3 || die "newfs failed"
 
 echo Mounting ${md_id}p3 with mount /dev/${md_id}p3 $playground/mnt
-mount /dev/${md_id}p3 $playground/mnt || {
-	echo mount failed
-	exit 1
-}
+mount /dev/${md_id}p3 $playground/mnt || die "mount failed"
 
 echo Installing world to $playground/mnt
-\time -h make installworld DESTDIR=$playground/mnt
+\time -h make installworld SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj DESTDIR=$playground/mnt
 
 # Alternative: use a known-good full userland
 #cat /usr/freebsd-dist/base.txz | tar -xf - -C $playground/mnt
 
 echo Installing world to $playground/jail
-\time -h make installworld DESTDIR=$playground/jail
+\time -h make installworld SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj DESTDIR=$playground/jail
 
 # KERNEL
 
 echo Installing the kernel to $playground/mnt
-\time -h make installkernel KERNCONF=OCCAM DESTDIR=$playground/mnt/
+\time -h make installkernel SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj KERNCONF=OCCAM DESTDIR=$playground/mnt/
 
 echo Installing the kernel to $playground/root/
-\time -h make installkernel KERNCONF=OCCAM DESTDIR=$playground/root/
+\time -h make installkernel SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj KERNCONF=OCCAM DESTDIR=$playground/root/
 
 echo Seeing how big the resulting installed kernel is
 ls -lh $playground/mnt/boot/kernel/kernel
@@ -278,13 +247,13 @@ ls -lh $playground/mnt/boot/kernel/kernel
 # DISTRIBUTION
 
 echo Installing distribution to $playground/mnt
-\time -h make distribution DESTDIR=$playground/mnt
+\time -h make distribution SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj DESTDIR=$playground/mnt
 
 echo Installing distribution to $playground/root
-\time -h make distribution DESTDIR=$playground/root
+\time -h make distribution SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj DESTDIR=$playground/root
 
 echo Installing distribution to $playground/jail
-\time -h make distribution DESTDIR=$playground/jail
+\time -h make distribution SRCCONF=$playground/src.conf MAKEOBJDIRPREFIX=$playground/obj DESTDIR=$playground/jail
 
 # Copying boot components from the mounted device to the root kernel device
 cp -rp $playground/mnt/boot/defaults $playground/root/boot/
@@ -307,9 +276,6 @@ echo ls $playground/root/boot/lua
 ls $playground/root/boot/lua
 echo
 
-echo Press the elusive ANY key to continue to installation
-read anykey
-
 echo
 echo Generating rc.conf
 
@@ -329,11 +295,11 @@ echo
 echo Generating fstab
 echo "/dev/vtbd0p3   /       ufs     rw,noatime      1       1" > "$playground/mnt/etc/fstab"
 echo "/dev/vtbd0p2   none    swap    sw      1       1" >> "$playground/mnt/etc/fstab"
-cat "$playground/mnt/etc/fstab" || { echo First fstab generation failed ; exit 1 ; }
+cat "$playground/mnt/etc/fstab" || die "First fstab generation failed"
 echo
 echo "/dev/vtbd0p3   /       ufs     rw,noatime      1       1" > "$playground/root/etc/fstab"
 echo "/dev/vtbd0p2   none    swap    sw      1       1" >> "$playground/root/etc/fstab"
-cat "$playground/root/etc/fstab" || { echo Second fstab generation failed ; exit 1 ; }
+cat "$playground/root/etc/fstab" || die "Second fstab generation failed"
 
 touch "$playground/mnt/firstboot"
 touch "$playground/root/firstboot"
@@ -347,7 +313,7 @@ autoboot_delay="5"
 bootverbose="1"
 EOF
 
-cat $playground/mnt/boot/loader.conf || { echo First loader.conf generation failed ; exit 1 ; }
+cat $playground/mnt/boot/loader.conf || die "First loader.conf generation failed"
 
 tee -a $playground/root/boot/loader.conf <<EOF
 kern.geom.label.disk_ident.enable="0"
@@ -356,8 +322,7 @@ autoboot_delay="5"
 bootverbose="1"
 EOF
 
-cat $playground/root/boot/loader.conf || \
-	{ echo Second loader.conf generation failed ; exit 1 ; }
+cat $playground/root/boot/loader.conf || die "Second loader.conf generation failed"
 
 # tzsetup will fail on separated kernel/userland - point at userland somehow
 # Could not open /mnt/usr/share/zoneinfo/UTC: No such file or directory
@@ -365,8 +330,8 @@ cat $playground/root/boot/loader.conf || \
 echo
 echo Setting the timezone
 tzsetup -s -C $playground/mnt UTC
-tzsetup -s -C $playground/mnt/root UTC
-tzsetup -s -C $playground/mnt/jail UTC
+#tzsetup -s -C $playground/root UTC
+tzsetup -s -C $playground/jail UTC
 
 echo Go inspect it! Cleaning up from here...
 echo Press the elusive ANY key to continue
@@ -376,9 +341,6 @@ df -h
 
 echo Unmounting $playground/mnt
 umount $playground/mnt
-
-echo Unmounting /usr/obj
-umount /usr/obj
 
 echo Destroying $md_id
 mdconfig -du $md_id
